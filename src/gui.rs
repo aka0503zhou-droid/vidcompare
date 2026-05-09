@@ -618,6 +618,19 @@ impl VidCompareApp {
             if let Some(ref e) = *ps.error_msg.lock().unwrap() {
                 self.error_message = Some(e.clone());
             }
+
+            // 处理完成时，确保从数据库重新加载所有结果
+            if ps.done.load(Ordering::SeqCst) {
+                if let Ok(db_guard) = self.db.lock() {
+                    if let Some(ref db) = *db_guard {
+                        if let Ok(db_records) = db.get_all_records() {
+                            if !db_records.is_empty() {
+                                self.results = db_records;
+                            }
+                        }
+                    }
+                }
+            }
             return;
         }
         if !ps.running.load(Ordering::SeqCst) && !ps.done.load(Ordering::SeqCst) {
@@ -718,11 +731,7 @@ impl VidCompareApp {
         let asc = self.sort_asc;
         r.sort_by(|a, b| {
             let cmp = match col {
-                SortCol::Index => {
-                    let ia = a.id.unwrap_or(0);
-                    let ib = b.id.unwrap_or(0);
-                    ia.cmp(&ib)
-                }
+                SortCol::Index => a.id.cmp(&b.id),
                 SortCol::RefName => a.ref_filename.cmp(&b.ref_filename),
                 SortCol::RefSize => a.ref_filesize.cmp(&b.ref_filesize),
                 SortCol::DistName => a.dist_filename.cmp(&b.dist_filename),
@@ -785,7 +794,7 @@ impl VidCompareApp {
         let results_indices: Vec<usize> = (start..end)
             .filter_map(|i| {
                 let rec = &filtered[i];
-                self.results.iter().position(|r| r.index == rec.index)
+                self.results.iter().position(|r| r.id == rec.id)
             })
             .collect();
 
@@ -796,7 +805,7 @@ impl VidCompareApp {
     fn select_all_filtered(&mut self) {
         let filtered = self.filtered_results();
         for rec in &filtered {
-            if let Some(idx) = self.results.iter().position(|r| r.index == rec.index) {
+            if let Some(idx) = self.results.iter().position(|r| r.id == rec.id) {
                 self.selected_for_delete.insert(idx);
             }
         }
@@ -1757,7 +1766,7 @@ impl VidCompareApp {
         let is_selected = self
             .selected_record
             .as_ref()
-            .map(|r| r.index == rec.index)
+            .map(|r| r.id == rec.id)
             .unwrap_or(false);
         let zebra_bg = if row_idx % 2 == 0 {
             C_SURFACE_ALT

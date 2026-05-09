@@ -218,10 +218,8 @@ impl Database {
     /// 清空所有记录并重置自增ID
     pub fn truncate(&self) -> Result<usize, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
-        // 使用 DELETE 而不是 DROP TABLE 来保留表结构
         conn.execute("DELETE FROM comparison_results", [])?;
-        // VACUUM 重置自增ID，使下次插入从1开始
-        conn.execute("VACUUM", [])?;
+        conn.execute("DELETE FROM sqlite_sequence WHERE name='comparison_results'", [])?;
         info!("Truncate 完成，ID已重置");
         Ok(1)
     }

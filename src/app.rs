@@ -86,15 +86,22 @@ impl App {
         
         let records: Vec<ComparisonRecord> = results.into_iter().map(|r| r.record).collect();
         
-        // 写入数据库
+        // 写入数据库并获取带 id 的记录
         if let Some(ref db) = self.db {
-            if let Err(e) = db.insert_records(&records) {
-                error!("数据库写入失败: {}", e);
+            match db.insert_records(&records) {
+                Ok(records_with_id) => {
+                    self.results = records_with_id.clone();
+                    return Ok(records_with_id);
+                }
+                Err(e) => {
+                    error!("数据库写入失败: {}", e);
+                    self.results = records.clone();
+                }
             }
+        } else {
+            self.results = records.clone();
         }
-        
-        self.results = records.clone();
-        Ok(records)
+        Ok(self.results.clone())
     }
 
     /// 更新配置
