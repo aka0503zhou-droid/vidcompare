@@ -1691,13 +1691,15 @@ impl VidCompareApp {
         let total_filtered = self.filtered_results().len();
 
         // 计算表格行高，每行高度 * 行数 = 最小滚动高度
+        // 使用一个足够大的固定值确保滚动条始终有效
         let row_height = 28.0;
-        let min_scroll_height = (row_height * page_records.len() as f32).max(200.0);
+        // 强制设置一个较大的最小高度，确保滚动条可用
+        let min_scroll_height = (row_height * total_filtered.max(20) as f32).max(600.0);
 
-        egui::ScrollArea::vertical()
-            .min_scrolled_height(min_scroll_height)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
+        let scroll_area = egui::ScrollArea::vertical()
+            .min_scrolled_height(min_scroll_height);
+
+        scroll_area.show(ui, |ui| {
                 egui::Frame::default()
                     .inner_margin(egui::Margin::symmetric(4.0, 2.0))
                     .show(ui, |ui| {

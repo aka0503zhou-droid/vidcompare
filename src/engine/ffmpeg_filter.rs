@@ -2,7 +2,12 @@
 //!
 //! 使用 FFmpeg 内置的 psnr/ssim/libvmaf 过滤器进行高性能计算
 //! 这些过滤器用 C 编写，比 Rust 实现快很多
-
+//!
+//! 分辨率处理策略 (参考 FFMetrics):
+//! - 以参考视频 (ref) 的分辨率为目标
+//! - 将待测视频 (dist/main) scale 到参考分辨率
+//! - 使用 bicubic 插值
+//! - 使用 settb+setpts 做时间戳同步
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -62,10 +67,202 @@ pub struct FilterResult {
     pub vmaf_per_frame: Vec<f32>,
 }
 
+/// 获取视频分辨率 (使用 ffprobe)
+fn get_video_resolution(path: &Path) -> Result<(u32, u32), String> {
+    let output = Command::new("ffprobe")
+        .args(&[
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_streams",
+            path.to_str().unwrap_or(""),
+        ])
+        .output()
+        .map_err(|e| format!("Failed to run ffprobe: {}", e))?;
+
+    if !output.status.success() {
+        return Err(format!("ffprobe failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+
+    let json_str = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&json_str)
+        .map_err(|e| format!("Failed to parse ffprobe JSON: {}", e))?;
+
+    // 找到视频流
+    if let Some(streams) = json.get("streams").and_then(|s| s.as_array()) {
+        for stream in streams {
+            if stream.get("codec_type").and_then(|t| t.as_str()) == Some("video") {
+                let width = stream.get("width").and_then(|w| w.as_u64()).unwrap_or(0) as u32;
+                let height = stream.get("height").and_then(|h| h.as_u64()).unwrap_or(0) as u32;
+                if width > 0 && height > 0 {
+                    return Ok((width, height));
+                }
+            }
+        }
+    }
+
+    Err("Could not find video stream dimensions".to_string())
+}
+
+/// 获取视频帧率 (从 ffprobe 的 streams->r_frame_rate 提取)
+fn get_video_fps(path: &Path) -> Result<f64, String> {
+    let output = Command::new("ffprobe")
+        .args(&[
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_streams",
+            path.to_str().unwrap_or(""),
+        ])
+        .output()
+        .map_err(|e| format!("Failed to run ffprobe: {}", e))?;
+
+    if !output.status.success() {
+        return Err(format!("ffprobe failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+
+    let json_str = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&json_str)
+        .map_err(|e| format!("Failed to parse ffprobe JSON: {}", e))?;
+
+    if let Some(streams) = json.get("streams").and_then(|s| s.as_array()) {
+        for stream in streams {
+            if stream.get("codec_type").and_then(|t| t.as_str()) == Some("video") {
+                if let Some(r_frame) = stream.get("r_frame_rate").and_then(|r| r.as_str()) {
+                    // 格式是 "30000/1001" 或 "30/1"
+                    if let Some((num, den)) = r_frame.split_once('/') {
+                        if let (Ok(n), Ok(d)) = (num.parse::<f64>(), den.parse::<f64>()) {
+                            if d > 0.0 {
+                                return Ok(n / d);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(30.0) // 默认 30fps
+}
+
+/// 构建 filter graph，使用 FFMetrics 策略:
+/// - 以参考视频 (ref) 的分辨率为目标
+/// - 将待测视频 (dist/main) scale 到参考分辨率
+/// - 使用 bicubic 插值
+/// - 使用 settb+setpts 做时间戳同步
+///
+/// 注意: [0:v] = dist (待测), [1:v] = ref (参考)
+fn build_filter_graph(
+    ref_width: u32,
+    ref_height: u32,
+    dist_width: u32,
+    dist_height: u32,
+    compute_psnr: bool,
+    compute_ssim: bool,
+    compute_vmaf: bool,
+) -> String {
+    let need_scale = ref_width != dist_width || ref_height != dist_height;
+    let scale_str = format!("{}:{}", ref_width, ref_height);
+
+    if need_scale {
+        // 分辨率不同：使用 FFMetrics 策略
+        // dist 需要 scale 到 ref 的分辨率
+        let main_process = format!(
+            "[0:v]settb=AVTB,setpts=PTS-STARTPTS,scale={}:flags=bicubic[main]",
+            scale_str
+        );
+        let ref_process = "[1:v]settb=AVTB,setpts=PTS-STARTPTS[ref]";
+
+        match (compute_psnr, compute_ssim, compute_vmaf) {
+            (true, true, true) => {
+                format!(
+                    "{};[1:v]split=3[ref1][ref2][ref3];[main]split=3[dist1][dist2][dist3];\
+                     [dist1][ref1]psnr[psnr];[dist2][ref2]ssim[ssim];[dist3][ref3]libvmaf[vmaf]",
+                    main_process
+                )
+            }
+            (true, true, false) => {
+                format!(
+                    "{};[1:v]split=2[ref1][ref2];[main]split=2[dist1][dist2];\
+                     [dist1][ref1]psnr[psnr];[dist2][ref2]ssim[ssim]",
+                    main_process
+                )
+            }
+            (true, false, true) => {
+                format!(
+                    "{};[1:v]split=2[ref1][ref2];[main]split=2[dist1][dist2];\
+                     [dist1][ref1]psnr[psnr];[dist2][ref2]libvmaf[vmaf]",
+                    main_process
+                )
+            }
+            (false, true, true) => {
+                format!(
+                    "{};[1:v]split=2[ref1][ref2];[main]split=2[dist1][dist2];\
+                     [dist1][ref1]ssim[ssim];[dist2][ref2]libvmaf[vmaf]",
+                    main_process
+                )
+            }
+            (true, false, false) => {
+                // 单 PSNR: main 是 dist (已 scale), ref 不变
+                format!("{};{};[main][ref]psnr[psnr]", main_process, ref_process)
+            }
+            (false, true, false) => {
+                format!("{};{};[main][ref]ssim[ssim]", main_process, ref_process)
+            }
+            (false, false, true) => {
+                format!("{};{};[main][ref]libvmaf[vmaf]", main_process, ref_process)
+            }
+            _ => "[main][ref]null".to_string(),
+        }
+    } else {
+        // 分辨率相同：直接比较，使用 settb+setpts 做时间戳同步
+        let common_process = "[0:v]settb=AVTB,setpts=PTS-STARTPTS[dist];[1:v]settb=AVTB,setpts=PTS-STARTPTS[ref]";
+
+        match (compute_psnr, compute_ssim, compute_vmaf) {
+            (true, true, true) => {
+                format!(
+                    "{};[dist][ref]split=3[dist1][dist2][dist3][ref1][ref2][ref3];\
+                     [dist1][ref1]psnr[psnr];[dist2][ref2]ssim[ssim];[dist3][ref3]libvmaf[vmaf]",
+                    common_process
+                )
+            }
+            (true, true, false) => {
+                format!(
+                    "{};[dist][ref]split=2[dist1][dist2][ref1][ref2];\
+                     [dist1][ref1]psnr[psnr];[dist2][ref2]ssim[ssim]",
+                    common_process
+                )
+            }
+            (true, false, true) => {
+                format!(
+                    "{};[dist][ref]split=2[dist1][dist2][ref1][ref2];\
+                     [dist1][ref1]psnr[psnr];[dist2][ref2]libvmaf[vmaf]",
+                    common_process
+                )
+            }
+            (false, true, true) => {
+                format!(
+                    "{};[dist][ref]split=2[dist1][dist2][ref1][ref2];\
+                     [dist1][ref1]ssim[ssim];[dist2][ref2]libvmaf[vmaf]",
+                    common_process
+                )
+            }
+            (true, false, false) => format!("{};[dist][ref]psnr[psnr]", common_process),
+            (false, true, false) => format!("{};[dist][ref]ssim[ssim]", common_process),
+            (false, false, true) => format!("{};[dist][ref]libvmaf[vmaf]", common_process),
+            _ => "[dist][ref]null".to_string(),
+        }
+    }
+}
+
 /// 同时计算多个指标 (使用 FFmpeg 的 psnr+ssim+vmaf 组合)
 ///
 /// 通过全局原子变量报告进度: pair_index, pair_total, frame
 /// cache_idx 用于帧进度更新（传入而非全局变量，避免多线程覆盖）
+///
+/// 分辨率处理策略 (参考 FFMetrics):
+/// - 以参考视频 (ref) 的分辨率为目标
+/// - 将待测视频 (dist/main) scale 到参考分辨率
+/// - 使用 bicubic 插值
+/// - settb+setpts 做时间戳同步
 pub fn calculate_all_metrics_ffmpeg_with_progress(
     ref_path: &Path,
     dist_path: &Path,
@@ -81,43 +278,36 @@ pub fn calculate_all_metrics_ffmpeg_with_progress(
         .map(|p| p.as_os_str())
         .unwrap_or_else(|| std::ffi::OsStr::new("ffmpeg"));
 
-    // GPU 检测
+    // 获取参考视频和待测视频的分辨率
+    let (ref_width, ref_height) = get_video_resolution(ref_path)?;
+    let (dist_width, dist_height) = get_video_resolution(dist_path)?;
+    let need_scale = ref_width != dist_width || ref_height != dist_height;
+
+    info!(
+        "Video dimensions: ref={}x{}, dist={}x{}, need_scale={}",
+        ref_width, ref_height, dist_width, dist_height, need_scale
+    );
+
+    // 获取帧率用于同步
+    let ref_fps = get_video_fps(ref_path)?;
+    let dist_fps = get_video_fps(dist_path)?;
+    let fps = ref_fps.round() as i32;
+
+    info!("Video fps: ref={:.2}, dist={:.2}, using={}", ref_fps, dist_fps, fps);
+
+    // 构建 filter graph
+    let filter_str = build_filter_graph(
+        ref_width, ref_height,
+        dist_width, dist_height,
+        compute_psnr, compute_ssim, compute_vmaf,
+    );
+
     let gpu_info = crate::engine::decoder::detect_gpu();
     let use_gpu = gpu_info.available;
 
-    // 构建 filter graph
-    // 每个指标使用独立的 split 和输出标签
-    // 注意: libvmaf 不使用 log=1，避免写入文件导致权限错误
-    let filter_str = match (compute_psnr, compute_ssim, compute_vmaf) {
-        (true, true, true) => {
-            "[0:v]split=3[ref1][ref2][ref3];[1:v]split=3[dist1][dist2][dist3];[ref1][dist1]psnr[psnr];[ref2][dist2]ssim[ssim];[ref3][dist3]libvmaf[vmaf]"
-        }
-        (true, true, false) => {
-            "[0:v]split=2[ref1][ref2];[1:v]split=2[dist1][dist2];[ref1][dist1]psnr[psnr];[ref2][dist2]ssim[ssim]"
-        }
-        (true, false, true) => {
-            "[0:v]split=2[ref1][ref2];[1:v]split=2[dist1][dist2];[ref1][dist1]psnr[psnr];[ref2][dist2]libvmaf[vmaf]"
-        }
-        (false, true, true) => {
-            "[0:v]split=2[ref1][ref2];[1:v]split=2[dist1][dist2];[ref1][dist1]ssim[ssim];[ref2][dist2]libvmaf[vmaf]"
-        }
-        (true, false, false) => {
-            "[0:v][1:v]psnr"
-        }
-        (false, true, false) => {
-            "[0:v][1:v]ssim"
-        }
-        (false, false, true) => {
-            "[0:v][1:v]libvmaf"
-        }
-        _ => {
-            return Err("No metrics to compute".to_string());
-        }
-    };
-
     let mut cmd = Command::new(exe);
 
-    // GPU 加速选项 - 只启用 cuvid/nvenc 解码，不改变帧格式
+    // GPU 加速选项
     if use_gpu {
         match &gpu_info.backend {
             crate::engine::decoder::GpuBackend::Cuda => {
@@ -134,9 +324,16 @@ pub fn calculate_all_metrics_ffmpeg_with_progress(
         info!("Using GPU acceleration: {:?}", gpu_info.backend);
     }
 
+    // FFMetrics 策略: 先对两个输入都进行 -r fps 同步
+    // 注意: FFMetrics 的 input 顺序是 dist, ref
+    // [0:v] = dist (待测), [1:v] = ref (参考)
+    // 所以命令行参数顺序也要保持: 先 dist, 再 ref
     cmd.args(&["-hide_banner"])
-        .args(&["-i", ref_path.to_str().unwrap_or("")])
+        .args(&["-nostdin"])
+        .args(&["-r", &fps.to_string()])
         .args(&["-i", dist_path.to_str().unwrap_or("")])
+        .args(&["-r", &fps.to_string()])
+        .args(&["-i", ref_path.to_str().unwrap_or("")])
         .args(&["-filter_complex", &filter_str]);
 
     // 根据启用的指标添加 map 参数
@@ -156,19 +353,19 @@ pub fn calculate_all_metrics_ffmpeg_with_progress(
             cmd.args(&["-map", "[ssim]"]).args(&["-map", "[vmaf]"]);
         }
         (true, false, false) => {
-            cmd.args(&["-map", "0:v"]);
+            cmd.args(&["-map", "[psnr]"]);
         }
         (false, true, false) => {
-            cmd.args(&["-map", "0:v"]);
+            cmd.args(&["-map", "[ssim]"]);
         }
         (false, false, true) => {
-            cmd.args(&["-map", "0:v"]);
+            cmd.args(&["-map", "[vmaf]"]);
         }
         _ => {}
     }
 
     cmd.args(&["-f", "null", "-"])
-        .args(&["-progress", "pipe:1"])  // 输出进度到 stdout
+        .args(&["-progress", "pipe:1"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 

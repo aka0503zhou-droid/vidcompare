@@ -78,10 +78,10 @@ impl Exporter for CsvExporter {
             let dist_filesize = record.dist_filesize.map(|s| format_size(s)).unwrap_or_default();
             let dist_bitrate = record.dist_bitrate.map(|b| format_bitrate(b)).unwrap_or_default();
             
-            writeln!(
+        writeln!(
                 writer,
                 "{},{},{},{},{},{},{},{},{:.2},{:.4},{:.1},{}",
-                record.index,
+                count + 1,
                 escape_csv(&record.ref_filename),
                 escape_csv(&dist_filename),
                 format_size(record.ref_filesize),
@@ -198,12 +198,13 @@ impl Exporter for HtmlExporter {
         writeln!(writer, "        <th>状态</th>")?;
         writeln!(writer, "      </tr></thead>")?;
         writeln!(writer, "      <tbody>")?;
-        
+
+        let mut count = 0;
         for record in &filtered {
             let compression = record.compression_ratio
                 .map(|v| format!("{:.1}%", v))
                 .unwrap_or_default();
-            
+
             let status_class = match record.status.to_string().as_str() {
                 "completed" => "status-completed",
                 "failed" => "status-failed",
@@ -211,9 +212,9 @@ impl Exporter for HtmlExporter {
                 "skipped" => "status-skipped",
                 _ => "status-pending",
             };
-            
+
             writeln!(writer, "      <tr>")?;
-            writeln!(writer, "        <td>{}</td>", record.index)?;
+            writeln!(writer, "        <td>{}</td>", count + 1)?;
             writeln!(writer, "        <td>{}</td>", escape_html(&record.ref_filename))?;
             writeln!(writer, "        <td>{}</td>", escape_html(record.dist_filename.as_deref().unwrap_or("-")))?;
             writeln!(writer, "        <td class=\"metric\">{}</td>", compression)?;
@@ -222,6 +223,7 @@ impl Exporter for HtmlExporter {
             writeln!(writer, "        <td class=\"metric\">{:.1}</td>", record.vmaf.unwrap_or(0.0))?;
             writeln!(writer, "        <td class=\"{}\">{}</td>", status_class, record.status)?;
             writeln!(writer, "      </tr>")?;
+            count += 1;
         }
         
         writeln!(writer, "      </tbody>")?;
