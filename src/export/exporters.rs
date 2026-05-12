@@ -61,7 +61,7 @@ impl Exporter for CsvExporter {
         writer.write_all(&[0xEF, 0xBB, 0xBF])?;
         
         // CSV 表头
-        writeln!(writer, "序号,原文件名,压缩文件名,原文件大小,压缩文件大小,压缩比(%),原文件码率,压缩文件码率,PSNR (dB),SSIM,VMAF,状态")?;
+        writeln!(writer, "序号,原文件名,分辨率,原文件大小,压缩文件名,压缩文件大小,原文件码率,压缩文件码率,压缩比,PSNR,SSIM,VMAF")?;
         
         let mut count = 0;
         for record in records {
@@ -77,22 +77,55 @@ impl Exporter for CsvExporter {
             let dist_filename = record.dist_filename.clone().unwrap_or_default();
             let dist_filesize = record.dist_filesize.map(|s| format_size(s)).unwrap_or_default();
             let dist_bitrate = record.dist_bitrate.map(|b| format_bitrate(b)).unwrap_or_default();
-            
-        writeln!(
+
+            // 分辨率
+            let resolution = match (record.ref_width, record.ref_height) {
+                (Some(w), Some(h)) => format!("{}x{}", w, h),
+                _ => "—".to_string(),
+            };
+
+            // 处理 NaN/无穷大
+            let psnr_str = record.psnr.map(|p| {
+                if p.is_nan() {
+                    "N/A".to_string()
+                } else if p.is_infinite() {
+                    if p.is_sign_positive() { "∞".to_string() } else { "-∞".to_string() }
+                } else {
+                    format!("{:.2}", p)
+                }
+            }).unwrap_or_else(|| "N/A".to_string());
+
+            let ssim_str = record.ssim.map(|s| {
+                if s.is_nan() {
+                    "N/A".to_string()
+                } else {
+                    format!("{:.4}", s)
+                }
+            }).unwrap_or_else(|| "N/A".to_string());
+
+            let vmaf_str = record.vmaf.map(|v| {
+                if v.is_nan() {
+                    "N/A".to_string()
+                } else {
+                    format!("{:.1}", v)
+                }
+            }).unwrap_or_else(|| "N/A".to_string());
+
+            writeln!(
                 writer,
-                "{},{},{},{},{},{},{},{},{:.2},{:.4},{:.1},{}",
+                "{},{},{},{},{},{},{},{},{},{},{},{}",
                 count + 1,
                 escape_csv(&record.ref_filename),
-                escape_csv(&dist_filename),
+                resolution,
                 format_size(record.ref_filesize),
+                escape_csv(&dist_filename),
                 dist_filesize,
-                compression,
                 format_bitrate(record.ref_bitrate),
                 dist_bitrate,
-                record.psnr.unwrap_or(0.0),
-                record.ssim.unwrap_or(0.0),
-                record.vmaf.unwrap_or(0.0),
-                record.status
+                compression,
+                psnr_str,
+                ssim_str,
+                vmaf_str,
             )?;
             count += 1;
         }

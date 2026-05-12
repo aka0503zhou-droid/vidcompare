@@ -202,6 +202,8 @@ enum SortCol {
     RefSize,
     DistName,
     DistSize,
+    RefBitrate,
+    DistBitrate,
     Ratio,
     Psnr,
     Ssim,
@@ -218,6 +220,8 @@ impl SortCol {
             Self::RefSize => "原大小",
             Self::DistName => "压缩文件",
             Self::DistSize => "压后大小",
+            Self::RefBitrate => "原码率",
+            Self::DistBitrate => "压后码率",
             Self::Ratio => "压缩比",
             Self::Psnr => "PSNR",
             Self::Ssim => "SSIM",
@@ -736,6 +740,8 @@ impl VidCompareApp {
                 SortCol::RefSize => a.ref_filesize.cmp(&b.ref_filesize),
                 SortCol::DistName => a.dist_filename.cmp(&b.dist_filename),
                 SortCol::DistSize => a.dist_filesize.cmp(&b.dist_filesize),
+                SortCol::RefBitrate => a.ref_bitrate.cmp(&b.ref_bitrate),
+                SortCol::DistBitrate => a.dist_bitrate.unwrap_or(0).cmp(&b.dist_bitrate.unwrap_or(0)),
                 SortCol::Ratio => {
                     let ra = a.compression_ratio.unwrap_or(-1.0);
                     let rb = b.compression_ratio.unwrap_or(-1.0);
@@ -820,7 +826,8 @@ impl VidCompareApp {
             ExportFormat::Json => "json",
             _ => "txt",
         };
-        let default_name = format!("vidcompare_report.{}", ext);
+        let timestamp = chrono::Local::now().format("%Y-%m-%d-%H-%M").to_string();
+        let default_name = format!("vidcompare_report_{}.{}", timestamp, ext);
         if let Some(path) = rfd::FileDialog::new()
             .add_filter(ext, &[ext])
             .set_file_name(&default_name)
@@ -848,7 +855,8 @@ impl VidCompareApp {
             ExportFormat::Json => "json",
             _ => "txt",
         };
-        let default_name = format!("vidcompare_full_report.{}", ext);
+        let timestamp = chrono::Local::now().format("%Y-%m-%d-%H-%M").to_string();
+        let default_name = format!("vidcompare_full_report_{}.{}", timestamp, ext);
         if let Some(path) = rfd::FileDialog::new()
             .add_filter(ext, &[ext])
             .set_file_name(&default_name)
@@ -1632,12 +1640,14 @@ impl VidCompareApp {
                     4 => Some(SortCol::RefSize),
                     5 => Some(SortCol::DistName),
                     6 => Some(SortCol::DistSize),
-                    8 => Some(SortCol::Ratio),
-                    9 => Some(SortCol::Psnr),
-                    10 => Some(SortCol::Ssim),
-                    11 => Some(SortCol::Vmaf),
-                    12 => Some(SortCol::Time),
-                    13 => Some(SortCol::Status),
+                    7 => Some(SortCol::RefBitrate),
+                    8 => Some(SortCol::DistBitrate),
+                    9 => Some(SortCol::Ratio),
+                    10 => Some(SortCol::Psnr),
+                    11 => Some(SortCol::Ssim),
+                    12 => Some(SortCol::Vmaf),
+                    13 => Some(SortCol::Time),
+                    14 => Some(SortCol::Status),
                     _ => None,
                 };
 
@@ -1673,6 +1683,13 @@ impl VidCompareApp {
                         }
                     }
                 } else {
+                    // 非排序列：绘制与可排序列一致的 C_HEADER 背景
+                    let avail = ui.available_rect_before_wrap();
+                    let rect = egui::Rect::from_min_max(
+                        avail.min,
+                        egui::pos2(avail.min.x + *width, avail.min.y + 20.0),
+                    );
+                    ui.painter().rect_filled(rect, 0.0, C_HEADER);
                     ui.add_sized(
                         [*width, 20.0],
                         egui::Label::new(
